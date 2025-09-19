@@ -45,10 +45,19 @@ fi
 print_status "Updating system packages..."
 apt update && apt upgrade -y
 
-# Install dependencies
+# Install dependencies (including cron)
 print_status "Installing dependencies..."
 apt install -y curl wget git build-essential libssl-dev pkg-config \
-    libgmp-dev libsecp256k1-dev jq ufw chrony
+    libgmp-dev libsecp256k1-dev jq ufw chrony cron
+
+# Install cron if not already installed
+if ! command -v crontab &> /dev/null; then
+    apt install -y cron
+fi
+
+# Start and enable cron service
+systemctl enable cron
+systemctl start cron
 
 # Create user and directories
 print_status "Creating system user and directories..."
@@ -98,13 +107,15 @@ case $CLIENT in
         
     "teku")
         print_status "Installing Teku..."
-        wget -O /usr/local/bin/teku https://artifacts.consensys.net/public/teku/raw/names/teku.tar.gz/versions/23.9.0/teku-23.9.0.tar.gz
-        tar -xzf /usr/local/bin/teku -C /usr/local/bin/
-        chmod +x /usr/local/bin/teku
+        wget -O /tmp/teku.tar.gz https://artifacts.consensys.net/public/teku/raw/names/teku.tar.gz/versions/23.9.0/teku-23.9.0.tar.gz
+        tar -xzf /tmp/teku.tar.gz -C /usr/local/bin/
+        chmod +x /usr/local/bin/teku/bin/teku
+        ln -s /usr/local/bin/teku/bin/teku /usr/local/bin/teku
         ;;
         
     "nimbus")
         print_status "Installing Nimbus..."
+        cd /tmp
         git clone https://github.com/status-im/nimbus-eth2.git
         cd nimbus-eth2
         make nimbus_beacon_node
@@ -125,7 +136,7 @@ metrics: true
 metrics-address: "0.0.0.0"
 metrics-port: $METRICS_PORT
 execution-endpoint: "http://localhost:8551"
-jwt-secret: "/path/to/jwt/secret"  # Update this after setting up execution client
+jwt-secret: "/etc/ethereum/jwt/jwt.hex"
 EOF
 
 # Create systemd service
@@ -152,7 +163,7 @@ ExecStart=/usr/local/bin/$CLIENT beacon_node \\
     --metrics-address 0.0.0.0 \\
     --metrics-port $METRICS_PORT \\
     --execution-endpoint http://localhost:8551 \\
-    --jwt-secret /path/to/jwt/secret  # Update this
+    --jwt-secret /etc/ethereum/jwt/jwt.hex
 
 StandardOutput=append:$LOG_DIR/beacon.log
 StandardError=append:$LOG_DIR/beacon-error.log
@@ -169,6 +180,13 @@ ufw allow $METRICS_PORT/tcp comment 'Beacon Metrics'
 ufw allow 9000/tcp comment 'P2P Networking'
 ufw allow 9000/udp comment 'P2P Networking'
 ufw --force enable
+
+# Create JWT secret directory and file
+print_status "Creating JWT secret..."
+mkdir -p /etc/ethereum/jwt
+openssl rand -hex 32 > /etc/ethereum/jwt/jwt.hex
+chmod 644 /etc/ethereum/jwt/jwt.hex
+chown -R $USERNAME:$USERNAME /etc/ethereum/jwt
 
 # Enable and start service
 print_status "Enabling and starting service..."
@@ -196,9 +214,12 @@ check_service() {
 }
 
 check_sync() {
-    # This is a placeholder - implement actual sync check based on your client
-    # For Lighthouse: curl http://localhost:5052/eth/v1/node/syncing
-    echo "$(date): Sync check placeholder" >> $LOG_FILE
+    # Simple sync check - modify based on your client
+    if curl -s http://localhost:5052/eth/v1/node/syncing > /dev/null 2>&1; then
+        echo "$(date): RPC endpoint responsive" >> $LOG_FILE
+    else
+        echo "$(date): RPC endpoint not responsive" >> $LOG_FILE
+    fi
 }
 
 check_service
@@ -206,16 +227,16 @@ check_sync
 EOF
 
 chmod +x /usr/local/bin/monitor-beacon.sh
+chown $USERNAME:$USERNAME /usr/local/bin/monitor-beacon.sh
 
 # Add to crontab for monitoring
-(crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/monitor-beacon.sh") | crontab -
+print_status "Setting up cron job for monitoring..."
+(crontab -l 2>/dev/null | grep -v "monitor-beacon.sh"; echo "*/5 * * * * /usr/local/bin/monitor-beacon.sh") | crontab -
 
 print_status "Installation completed!"
-print_warning "Important next steps:"
-print_warning "1. Set up an Execution Client (Geth, Nethermind, etc.)"
-print_warning "2. Configure JWT secret for auth between execution and consensus clients"
-print_warning "3. Update the JWT path in the systemd service file"
-print_warning "4. Check logs: journalctl -u $SERVICE_NAME -f"
-print_warning "5. Monitor sync status"
+print_status "Service status: systemctl status $SERVICE_NAME"
+print_status "Logs: journalctl -u $SERVICE_NAME -f"
+print_status "RPC endpoint: http://$(curl -s ifconfig.me):$RPC_PORT"
 
-echo -e "${GREEN}Beacon RPC endpoint will be available at: http://your-vps-ip:$RPC_PORT${NC}"
+print_warning "Important: You still need to set up an Execution Client (Geth, Nethermind, etc.)"
+print_warning "The beacon node will wait for the execution client to sync first"
